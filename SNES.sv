@@ -861,6 +861,34 @@ wire        SDRAM_SNI_RD;
 wire        SDRAM_SNI_WR;
 wire        SDRAM_SNI_READY;
 
+// --- RetroAchievements RAM Mirror signals ---
+wire [24:0] ra_sni_addr;
+wire        ra_sni_rd_req;
+wire        ra_sni_word;
+wire [17:0] ra_bsram_addr;
+wire        ra_bsram_rd;
+wire        ra_active;
+wire [28:0] ra_ddram_addr;
+wire [63:0] ra_ddram_din;
+wire  [7:0] ra_ddram_be;
+wire        ra_ddram_req;
+wire        ra_ddram_ack;
+wire [28:0] ra_ddram_rd_addr;
+wire        ra_ddram_rd_req;
+wire        ra_ddram_rd_ack;
+wire [63:0] ra_ddram_rd_dout;
+wire [31:0] ra_dbg_frame;
+
+// SNI SDRAM mux: RA mirror takes over SNI port during transfer
+wire [24:0] sdram_sni_addr_mux = ra_active ? ra_sni_addr : SDRAM_SNI_ADDR;
+wire [15:0] sdram_sni_din_mux  = ra_active ? 16'h0000 : {8'h00, SDRAM_SNI_DATA};
+wire        sdram_sni_rd_mux   = ra_active ? ra_sni_rd_req : SDRAM_SNI_RD;
+wire        sdram_sni_wr_mux   = ra_active ? 1'b0 : SDRAM_SNI_WR;
+wire        sdram_sni_word_mux = ra_active ? ra_sni_word : 1'b0;
+
+// BSRAM save RAM size (bytes) from cart header
+wire [17:0] ra_bsram_size = |ram_mask[17:0] ? (ram_mask[17:0] + 18'd1) : 18'd0;
+
 wire[24:0] cart_addr_download = ioctl_addr-10'd512;
 wire[23:0] ssbin_addr_download = { 8'hFF, ioctl_addr[15:0] };
 wire[23:0] addr_download = ssbin_download ? ssbin_addr_download : cart_addr_download[23:0];
@@ -918,13 +946,13 @@ sdram sdram
 	.rfs1(clearing_ram ? 1'b0 : !RESET_N ? RESET_REFRESH : SNES_REFRESH),
 	.word1(0),
 
-	.sni_addr(SDRAM_SNI_ADDR),
-	.sni_din({8'h00,SDRAM_SNI_DATA}),
+	.sni_addr(sdram_sni_addr_mux),
+	.sni_din(sdram_sni_din_mux),
 	.sni_dout(sdr_sni_dout),
-	.sni_rd_req(SDRAM_SNI_RD),
-	.sni_wr_req(SDRAM_SNI_WR),
+	.sni_rd_req(sdram_sni_rd_mux),
+	.sni_wr_req(sdram_sni_wr_mux),
 	.sni_ready(SDRAM_SNI_READY),
-	.sni_word(0)
+	.sni_word(sdram_sni_word_mux)
 );
 
 assign WRAM_Q = sdr_dout1[7:0];
@@ -1004,9 +1032,9 @@ dpram_dif #(BSRAM_BITS,8,BSRAM_BITS-1,16) bsram
 	.clock(clk_sys),
 
 	//Thrash the BSRAM upon ROM loading
-	.address_a(clearing_ram ? mem_fill_addr[BSRAM_BITS-1:0] : BSRAM_SNI_READY ? BSRAM_SNI_ADDR : BSRAM_ADDR[BSRAM_BITS-1:0]),
-	.data_a(clearing_ram ? 8'hFF : BSRAM_SNI_READY ? BSRAM_SNI_D : BSRAM_D),
-	.wren_a(clearing_ram ? mem_fill_we : BSRAM_SNI_READY ? BSRAM_SNI_WR : ~BSRAM_WE_N),
+	.address_a(clearing_ram ? mem_fill_addr[BSRAM_BITS-1:0] : (BSRAM_SNI_READY && ra_active && ra_bsram_rd) ? ra_bsram_addr[BSRAM_BITS-1:0] : BSRAM_SNI_READY ? BSRAM_SNI_ADDR : BSRAM_ADDR[BSRAM_BITS-1:0]),
+	.data_a(clearing_ram ? 8'hFF : BSRAM_SNI_READY ? (ra_active ? 8'h00 : BSRAM_SNI_D) : BSRAM_D),
+	.wren_a(clearing_ram ? mem_fill_we : BSRAM_SNI_READY ? (ra_active ? 1'b0 : BSRAM_SNI_WR) : ~BSRAM_WE_N),
 	.q_a(BSRAM_Q),
 
 	.address_b({sd_lba[BSRAM_BITS-10:0],sd_buff_addr}),
@@ -1553,7 +1581,46 @@ ddram ddram
 	.rdaddr2(msu_ram_addr), // MSU is at $2060.0000-3F7F.FFFF
 	.dout2(msu_ram_dout),
 	.rd_req2(msu_ram_req),
-	.rd_ack2(msu_ram_ack)
+	.rd_ack2(msu_ram_ack),
+
+	.ra_addr(ra_ddram_addr),
+	.ra_din(ra_ddram_din),
+	.ra_be(ra_ddram_be),
+	.ra_req(ra_ddram_req),
+	.ra_ack(ra_ddram_ack),
+
+	.ra_rd_addr(ra_ddram_rd_addr),
+	.ra_rd_req(ra_ddram_rd_req),
+	.ra_rd_ack(ra_ddram_rd_ack),
+	.ra_dout(ra_ddram_rd_dout)
+);
+
+// --- RetroAchievements RAM Mirror ---
+ra_ram_mirror_snes ra_mirror (
+	.clk             (clk_sys),
+	.reset           (reset),
+	.vblank          (VBlank),
+	.sni_addr        (ra_sni_addr),
+	.sni_rd_req      (ra_sni_rd_req),
+	.sni_dout        (sdr_sni_dout),
+	.sni_ready       (SDRAM_SNI_READY),
+	.sni_word        (ra_sni_word),
+	.bsram_addr      (ra_bsram_addr),
+	.bsram_dout      (BSRAM_Q),
+	.bsram_rd        (ra_bsram_rd),
+	.bsram_ready     (BSRAM_SNI_READY),
+	.bsram_size      (ra_bsram_size),
+	.ddram_wr_addr   (ra_ddram_addr),
+	.ddram_wr_din    (ra_ddram_din),
+	.ddram_wr_be     (ra_ddram_be),
+	.ddram_wr_req    (ra_ddram_req),
+	.ddram_wr_ack    (ra_ddram_ack),
+	.ddram_rd_addr   (ra_ddram_rd_addr),
+	.ddram_rd_req    (ra_ddram_rd_req),
+	.ddram_rd_ack    (ra_ddram_rd_ack),
+	.ddram_rd_dout   (ra_ddram_rd_dout),
+	.active          (ra_active),
+	.dbg_frame_counter(ra_dbg_frame)
 );
 
 

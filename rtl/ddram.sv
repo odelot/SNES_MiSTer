@@ -53,7 +53,20 @@ module ddram
 	input  [31:3] rdaddr2,
 	output [63:0] dout2,
 	input         rd_req2,
-	output reg    rd_ack2
+	output reg    rd_ack2,
+
+	// RetroAchievements RAM mirror write channel
+	input  [28:0] ra_addr,
+	input  [63:0] ra_din,
+	input   [7:0] ra_be,
+	input         ra_req,
+	output reg    ra_ack,
+
+	// RetroAchievements RAM mirror read channel
+	input  [28:0] ra_rd_addr,
+	input         ra_rd_req,
+	output reg    ra_rd_ack,
+	output reg [63:0] ra_dout
 );
 
 assign DDRAM_BURSTCNT = ram_burst;
@@ -78,6 +91,8 @@ reg  [7:0] ram_be = 0;
 
 reg [1:0]  state  = 0;
 reg        ch = 0;
+reg        ra_wr_pending = 0;
+reg        ra_rd_pending = 0;
 
 reg [1:0]  cache_valid;
 
@@ -150,25 +165,52 @@ always @(posedge DDRAM_CLK) begin
 						ch 			<= 1;
 						state       <= 2;
 					end 
-				end 
+				end
+				else if(ra_req != ra_ack) begin
+					ram_be      <= ra_be;
+					ram_data    <= ra_din;
+					ram_address <= ra_addr;
+					ram_write   <= 1;
+					ram_burst   <= 1;
+					ra_wr_pending <= 1;
+					state       <= 1;
+				end
+				else if(ra_rd_req != ra_rd_ack) begin
+					ram_address   <= ra_rd_addr;
+					ram_read      <= 1;
+					ram_burst     <= 1;
+					ra_rd_pending <= 1;
+					state         <= 2;
+				end
 
 			1: begin
 					cache_valid <= 2'b00;
-					if(ch) we_ack <= we_req;
+					if(ra_wr_pending) begin
+						ra_ack <= ra_req;
+						ra_wr_pending <= 0;
+					end
+					else if(ch) we_ack <= we_req;
 					else rom_ack <= rom_req;
 					state <= 0;
 				end
 
 			2: if(DDRAM_DOUT_READY) begin
-					if (~ch) begin
+					if (ra_rd_pending) begin
+						ra_dout <= DDRAM_DOUT;
+						ra_rd_ack <= ra_rd_req;
+						ra_rd_pending <= 0;
+						state <= 0;
+					end
+					else if (~ch) begin
 						ram_q  <= DDRAM_DOUT;
 						rom_ack <= rom_req;
+						state <= 3;
 					end
 					else begin
 						ram_q2  <= DDRAM_DOUT;
 						rd_ack2 <= rd_req2;
-					end 
-					state <= 3;
+						state <= 3;
+					end
 				end
 
 			3: if(DDRAM_DOUT_READY) begin
