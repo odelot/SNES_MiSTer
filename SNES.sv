@@ -293,7 +293,7 @@ wire reset = RESET | buttons[1] | status[0] | cart_download | spc_download | bk_
 // 0         1         2         3          4         5         6
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXXX XXXXXXXX
+// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXXX XXXXXXXX X
 
 `include "build_id.v"
 parameter CONF_STR = {
@@ -303,13 +303,13 @@ parameter CONF_STR = {
 	"-;",
 	"O[50],Save state to SD,On,Off;",
 	"O[52:51],Savestate Slot,1,2,3,4;",
-	"d6R[47],Save state (Alt-F1);",
+	"d7R[47],Save state (Alt-F1);",
 	"d6R[48],Load state (F1);",
 	"-;",
 	"OEF,Video Region,Auto,NTSC,PAL;",
 	"O13,ROM Header,Auto,No Header,LoROM,HiROM,ExHiROM;",
 	"-;",
-	"C,Cheats;",
+	"H2C,Cheats;",
 	"H2OO,Cheats Enabled,Yes,No;",
 	"-;",
 	"D0RC,Load Backup RAM;",
@@ -380,7 +380,8 @@ parameter CONF_STR = {
 
 wire  [1:0] buttons;
 wire [63:0] status;
-wire [15:0] status_menumask = {ss_allow ,en216p, !GUN_MODE, ~turbo_allow, ~gg_available, ~GSU_ACTIVE, ~bk_ena};
+wire hardcore = status[58];
+wire [15:0] status_menumask = {ss_allow_no_hc, (ss_allow & ~hardcore), en216p, !GUN_MODE, ~turbo_allow, (~gg_available | hardcore), ~GSU_ACTIVE, ~bk_ena};
 wire        forced_scandoubler;
 reg  [31:0] sd_lba;
 reg         sd_rd = 0;
@@ -693,7 +694,7 @@ main main
 
 	.EXT_RTC(RTC),
 
-	.GG_EN(status[24]),
+	.GG_EN(status[24] | hardcore),
 	.GG_CODE(gg_code),
 	.GG_RESET((code_download && ioctl_wr && !ioctl_addr) || cart_download),
 	.GG_AVAILABLE(gg_available),
@@ -738,7 +739,7 @@ main main
 
 	.SS_SAVE(ss_save),
 	.SS_TOSD(~status[50]),
-	.SS_LOAD(ss_load),
+	.SS_LOAD(ss_load & ~hardcore),
 	.SS_SLOT(ss_slot),
 	.SS_AVAIL(ss_avail),
 
@@ -1629,14 +1630,29 @@ wire [1:0] ss_slot;
 wire [7:0] ss_info;
 wire ss_save, ss_load, ss_info_req;
 wire ss_status;
-wire ss_allow = ss_avail & cart_ready & ssbin_ready;
+wire ss_allow = ss_avail & cart_ready & ssbin_ready & ~hardcore;
+wire ss_allow_no_hc = ss_avail & cart_ready & ssbin_ready;
 wire ss_joy_start = joy0[11] | status[53];
+
+//Track Alt key state to allow Alt+F1-F4 (save) but block F1-F4 alone (load) in hardcore
+reg kbd_alt = 1'b0;
+reg kbd_strobe_old = 1'b0;
+always @(posedge clk_sys) begin
+	kbd_strobe_old <= ps2_key[10];
+	if (kbd_strobe_old != ps2_key[10] && ps2_key[7:0] == 'h11) begin
+		kbd_alt <= ps2_key[9];
+	end
+end
+wire skip_ps2_fkey = (ps2_key[7:0] == 'h04) || (ps2_key[7:0] == 'h05) || (ps2_key[7:0] == 'h06) || (ps2_key[7:0] == 'h0C);
+wire block_load_kbd = skip_ps2_fkey && hardcore && !kbd_alt;
+wire [10:0] ps2_key_adjust = block_load_kbd ? 11'h0 : ps2_key[10:0];
 
 savestate_ui #(.INFO_TIMEOUT_BITS(25)) savestate_ui
 (
 	.clk            (clk_sys       ),
-	.ps2_key        (ps2_key[10:0] ),
+	.ps2_key        (ps2_key_adjust),
 	.allow_ss       (ss_allow      ),
+	.allow_save     (ss_allow_no_hc),
 	.joySS          (joy0[12]      ),
 	.joyRight       (joy0[0]       ),
 	.joyLeft        (joy0[1]       ),
