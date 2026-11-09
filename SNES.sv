@@ -761,13 +761,62 @@ wire        ra_ddram_rd_ack;
 wire [63:0] ra_ddram_rd_dout;
 wire [31:0] ra_dbg_frame;
 
-// SNI SDRAM mux: RA mirror takes over the shared SNI port during its
-// VBlank transfer window (ra_active); SNI host accesses wait meanwhile.
-wire [24:0] sdram_sni_addr_mux = ra_active ? ra_sni_addr : SDRAM_SNI_ADDR;
-wire [15:0] sdram_sni_din_mux  = ra_active ? 16'h0000 : {8'h00, SDRAM_SNI_DATA};
-wire        sdram_sni_rd_mux   = ra_active ? ra_sni_rd_req : SDRAM_SNI_RD;
-wire        sdram_sni_wr_mux   = ra_active ? 1'b0 : SDRAM_SNI_WR;
-wire        sdram_sni_word_mux = ra_active ? ra_sni_word : 1'b0;
+// SDRAM SNI port, shared by the host PC (sni.sv) and the RA mirror. sdram.sv
+// serves one SNI client at a time, so ra_sni_arb issues the two clients'
+// accesses one after the other and returns each one its own ready and data
+// (see the header of ra_sni_arb.sv for what went wrong without it).
+wire [24:0] sdram_sni_addr;
+wire [15:0] sdram_sni_din;
+wire        sdram_sni_rd, sdram_sni_wr, sdram_sni_word;
+wire        sdram_sni_ready;
+wire [15:0] ra_sni_dout;
+wire        ra_sni_ready;
+
+// Hardcore: the host PC may still read memory (trackers, autosplitters), but
+// SNI writes to SDRAM and BSRAM are dropped. sni.sv still sees them complete.
+wire        sni_wr_block = hardcore;
+
+generate
+if (ENABLE_RA) begin : sni_arb_gen
+	ra_sni_arb sni_arb
+	(
+		.clk    (clk_sys),
+		.reset  (reset),
+
+		.a_addr (SDRAM_SNI_ADDR),
+		.a_din  (SDRAM_SNI_DATA),
+		.a_rd   (SDRAM_SNI_RD),
+		.a_wr   (SDRAM_SNI_WR & ~sni_wr_block),
+		.a_q    (SDRAM_SNI_Q),
+		.a_ready(SDRAM_SNI_READY),
+
+		.b_addr (ra_sni_addr),
+		.b_word (ra_sni_word),
+		.b_rd   (ra_sni_rd_req),
+		.b_dout (ra_sni_dout),
+		.b_ready(ra_sni_ready),
+
+		.s_addr (sdram_sni_addr),
+		.s_din  (sdram_sni_din),
+		.s_word (sdram_sni_word),
+		.s_rd   (sdram_sni_rd),
+		.s_wr   (sdram_sni_wr),
+		.s_ready(sdram_sni_ready),
+		.s_dout (sdr_sni_dout)
+	);
+end else begin : sni_arb_gen
+	// RA disabled: sni.sv talks to sdram.sv directly, as upstream.
+	assign sdram_sni_addr  = SDRAM_SNI_ADDR;
+	assign sdram_sni_din   = {8'h00, SDRAM_SNI_DATA};
+	assign sdram_sni_rd    = SDRAM_SNI_RD;
+	assign sdram_sni_wr    = SDRAM_SNI_WR;
+	assign sdram_sni_word  = 1'b0;
+	assign SDRAM_SNI_Q     = sdr_sni_dout[7:0];
+	assign SDRAM_SNI_READY = sdram_sni_ready;
+	assign ra_sni_dout     = 16'd0;
+	assign ra_sni_ready    = 1'b0;
+end
+endgenerate
 
 // Port B of bsram DPRAM: 16-bit, word-addressed. Used for SD card save/load
 // (bk_state=1) or RA reads (otherwise). SD save/load is infrequent and user-
@@ -781,6 +830,27 @@ wire [15:0] bsram_port_b_q;  // Port B raw 16-bit output
 wire  [7:0] ra_bsram_dout_b = ra_bsram_addr[0] ? bsram_port_b_q[15:8] : bsram_port_b_q[7:0];
 // BSRAM save RAM size (bytes) from cart header
 wire [17:0] ra_bsram_size = |ram_mask[17:0] ? (ram_mask[17:0] + 18'd1) : 18'd0;
+
+// RA SNI guard: all of WRAM sits in one SDRAM bank, and can_start_sni only checks
+// that no access is in flight. An SNI read can therefore start one master clock
+// before or after a CPU WRAM access, putting two ACTIVEs on that bank 46.6ns apart
+// (tRC is 60ns). The CPU timing in CPU.vhd has a slot clear of both: writes rise on
+// SYSCLKF_CE (c=0) and reads on READ_PULSE (c=4), so c=2 is 93ns from either.
+// Turbo reads rise at c=3, so c=2 is skipped when the cycle reads WRAM; the sni_wait
+// wrap keeps a run of those, or a stopped CPU, from starving the mirror.
+// Hidden status bit (no OSD entry), written by Main from retroachievements.cfg
+// (snes_sni_guard, on by default from Main v1.16.0). status[59]=0 -> Off, and SNI
+// timing is unchanged, as with a Main that never writes the bit.
+reg        sysclkf_d;
+reg  [5:0] sni_wait;
+reg        sni_hold;
+wire       sni_guard = ENABLE_RA ? status[59] : 1'b0;
+wire       sni_slot  = sysclkf_d & ~(status[4] & turbo_allow & ~WRAM_CE_N & ~WRAM_OE_N);
+always @(posedge clk_sys) begin
+	sysclkf_d <= SNES_SYSCLKF_CE;
+	sni_wait  <= sni_slot ? 6'd0 : sni_wait + 6'd1;
+	sni_hold  <= sni_guard & ~sni_slot & ~&sni_wait;
+end
 
 sdram sdram
 (
@@ -814,18 +884,18 @@ sdram sdram
 	.rfs1(clearing_ram ? 1'b0 : !RESET_N ? RESET_REFRESH : SNES_REFRESH),
 	.word1(0),
 
-	// Shared port: SNI (host PC) and RA mirror, arbitrated by ra_active.
-	.sni_addr  (sdram_sni_addr_mux),
-	.sni_din   (sdram_sni_din_mux),
+	// Shared port: SNI (host PC) and RA mirror, through ra_sni_arb.
+	.sni_addr  (sdram_sni_addr),
+	.sni_din   (sdram_sni_din),
 	.sni_dout  (sdr_sni_dout),
-	.sni_rd_req(sdram_sni_rd_mux),
-	.sni_wr_req(sdram_sni_wr_mux),
-	.sni_ready (SDRAM_SNI_READY),
-	.sni_word  (sdram_sni_word_mux)
+	.sni_rd_req(sdram_sni_rd),
+	.sni_wr_req(sdram_sni_wr),
+	.sni_ready (sdram_sni_ready),
+	.sni_hold  (sni_hold),
+	.sni_word  (sdram_sni_word)
 );
 
 assign WRAM_Q = sdr_dout1[7:0];
-assign SDRAM_SNI_Q = sdr_sni_dout[7:0];
 
 wire        VRAM_OE_N;
 reg         VRAM_OE_N_DELAYED;
@@ -904,7 +974,7 @@ dpram_dif #(BSRAM_BITS,8,BSRAM_BITS-1,16) bsram
 	//Thrash the BSRAM upon ROM loading
 	.address_a(clearing_ram ? mem_fill_addr[BSRAM_BITS-1:0] : BSRAM_SNI_READY ? BSRAM_SNI_ADDR : BSRAM_ADDR[BSRAM_BITS-1:0]),
 	.data_a(clearing_ram ? 8'hFF : BSRAM_SNI_READY ? BSRAM_SNI_D : BSRAM_D),
-	.wren_a(clearing_ram ? mem_fill_we : BSRAM_SNI_READY ? BSRAM_SNI_WR : ~BSRAM_CE_N & ~BSRAM_WE_N),
+	.wren_a(clearing_ram ? mem_fill_we : BSRAM_SNI_READY ? BSRAM_SNI_WR & ~sni_wr_block : ~BSRAM_CE_N & ~BSRAM_WE_N),
 	.q_a(BSRAM_Q),
 
 	// Port B: SD card save/load -or- RA byte reads (see bsram_b_addr mux above)
@@ -1477,8 +1547,8 @@ if (ENABLE_RA) begin : ra_gen
 		.vblank          (VBlank),
 		.sni_addr        (ra_sni_addr),
 		.sni_rd_req      (ra_sni_rd_req),
-		.sni_dout        (sdr_sni_dout),
-		.sni_ready       (SDRAM_SNI_READY),
+		.sni_dout        (ra_sni_dout),
+		.sni_ready       (ra_sni_ready),
 		.sni_word        (ra_sni_word),
 		.bsram_addr      (ra_bsram_addr),
 		.bsram_dout      (ra_bsram_dout_b), // Port B: independent of SA-1 Port A

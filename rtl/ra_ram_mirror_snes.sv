@@ -66,14 +66,35 @@ module ra_ram_mirror_snes #(
 localparam [28:0] ADDRLIST_BASE = DDRAM_BASE + 29'h8000;  // byte offset 0x40000 / 8
 localparam [28:0] VALCACHE_BASE = DDRAM_BASE + 29'h9000;  // byte offset 0x48000 / 8
 localparam [31:0] WRAM_LIMIT    = 32'h20000;              // 128KB boundary
+
+// Everything at or above WRAM_LIMIT used to fall through to BSRAM unchecked,
+// with bsram_addr <= cur_addr - 0x20000 truncated into an 18-bit register. Two
+// rcheevos regions land there and both read the wrong memory silently:
+//   - Cartridge RAM 0x20000-0x9FFFF is a 512KB window but a cart only has
+//     bsram_size of it. Past that, two things went wrong: up to 256KB the read
+//     ran off into whatever the BSRAM array held beyond the save, and from
+//     0x60000 on the 18-bit register wrapped back to the start of the save.
+//   - I-RAM (SA-1) 0xA0000-0xA07FF truncated to 0x00000, i.e. it returned the
+//     first 2KB of cartridge SRAM. Affects the SA-1 titles (Super Mario RPG,
+//     Kirby Super Star, ...).
+// Both are now bounded and read 0 when unmapped, matching what rcheevos
+// returns for an address outside the emulator's buffer. Serving real SA-1
+// I-RAM needs a second port on the IRAM spram inside SA1.vhd -- not done here.
+wire [31:0] bsram_off = cur_addr - WRAM_LIMIT;
+wire        bsram_hit = (cur_addr >= WRAM_LIMIT) && (bsram_off < {14'd0, bsram_size});
 localparam [12:0] MAX_ADDRS     = 13'd4096;
+
+// Version published in the DDRAM header (major<<8 | minor). Informational only
+// -- rtquery is gated on the debug byte at 0x17, not on this. Bump the minor on
+// every synthesis so a log always identifies the bitstream that produced it.
+localparam [15:0] CORE_VERSION = 16'h0302;   // 3.2 — rtquery reaches SDRAM, SNI guard, SNI arbiter
 
 // Realtime query mailbox (Tier 1 smart cache)
 localparam [28:0] QUERY_CTRL_ADDR = DDRAM_BASE + 29'hA000;  // byte offset 0x50000 / 8
 localparam [28:0] QUERY_REQ_BASE  = DDRAM_BASE + 29'hA001;  // byte offset 0x50008 / 8
 localparam [28:0] QUERY_RESP_BASE = DDRAM_BASE + 29'hA011;  // byte offset 0x50088 / 8
 localparam [28:0] ARM_CFG_ADDR    = DDRAM_BASE + 29'd8;        // byte offset 0x40: ARM-written config
-localparam [3:0]  MAX_RT_QUERIES  = 4'd16;
+localparam [7:0]  MAX_RT_QUERIES  = 8'd16;   // was [3:0]=4'd16 -> truncated to 0
 
 // ======================================================================
 // Clock domain crossing synchronizers
@@ -213,7 +234,7 @@ reg [15:0] dbg_first_addr;   // first cur_addr from S_DISPATCH
 reg  [7:0] qry_request_seq;
 reg  [7:0] qry_last_seen_seq;
 reg  [7:0] qry_num;
-reg  [3:0] qry_idx;
+reg  [4:0] qry_idx;   // 0..16: needs 5 bits to reach the batch cap
 reg [31:0] qry_addr;
 reg  [7:0] qry_num_bytes;
 reg [31:0] qry_value;
@@ -267,7 +288,7 @@ always @(posedge clk) begin
 				dbg_first_addr  <= 16'd0;
 				// Write header with busy=1
 				ddram_wr_addr <= DDRAM_BASE;
-				ddram_wr_din  <= {16'h0300, 8'h01, 8'd0, 32'h52414348};
+				ddram_wr_din  <= {CORE_VERSION, 8'h01, 8'd0, 32'h52414348};
 				ddram_wr_be   <= 8'hFF;
 				ddram_wr_req  <= ~ddram_wr_req;
 				return_state  <= S_READ_HDR;
@@ -389,9 +410,14 @@ always @(posedge clk) begin
 				dbg_wram_cnt <= dbg_wram_cnt + 16'd1;
 				state <= S_FETCH_WRAM;
 			end
-			else begin
+			else if (bsram_hit) begin
 				dbg_bsram_cnt <= dbg_bsram_cnt + 16'd1;
 				state <= S_FETCH_BSRAM;
+			end
+			else begin
+				// Past the cart's save RAM (or SA-1 I-RAM): unmapped.
+				fetch_byte <= 8'd0;
+				state      <= S_STORE_VAL;
 			end
 		end
 
@@ -540,7 +566,7 @@ always @(posedge clk) begin
 		// =============================================================
 		S_WR_HDR0: begin
 			ddram_wr_addr <= DDRAM_BASE;
-			ddram_wr_din  <= {16'h0300, 8'h00, 8'd0, 32'h52414348};
+			ddram_wr_din  <= {CORE_VERSION, 8'h00, 8'd0, 32'h52414348};
 			ddram_wr_be   <= 8'hFF;
 			ddram_wr_req  <= ~ddram_wr_req;
 			return_state  <= S_WR_HDR1;
@@ -605,9 +631,9 @@ always @(posedge clk) begin
 		S_QRY_PARSE: begin
 			if (rd_data[7:0] != qry_last_seen_seq && rd_data[15:8] != 8'd0) begin
 				qry_request_seq <= rd_data[7:0];
-				qry_num         <= (rd_data[15:8] > {4'd0, MAX_RT_QUERIES}) ?
-				                   {4'd0, MAX_RT_QUERIES} : rd_data[15:8];
-				qry_idx         <= 4'd0;
+				qry_num         <= (rd_data[15:8] > MAX_RT_QUERIES) ?
+				                   MAX_RT_QUERIES : rd_data[15:8];
+				qry_idx         <= 5'd0;
 				state           <= S_QRY_RD_REQ;
 			end else begin
 				state <= S_IDLE;
@@ -615,7 +641,12 @@ always @(posedge clk) begin
 		end
 
 		S_QRY_RD_REQ: begin
-			ddram_rd_addr <= QUERY_REQ_BASE + {25'd0, qry_idx};
+			// Marks the mirror busy for the query, as during a scan. This used
+			// to switch the SNI mux in SNES.sv, without which the query never
+			// reached the SDRAM; ra_sni_arb now routes every request on its own.
+			// S_IDLE releases this.
+			active        <= 1'b1;
+			ddram_rd_addr <= QUERY_REQ_BASE + {25'd0, qry_idx[3:0]};
 			ddram_rd_req  <= ~ddram_rd_req;
 			return_state  <= S_QRY_FETCH;
 			state         <= S_DD_RD_WAIT;
@@ -634,9 +665,12 @@ always @(posedge clk) begin
 				qry_sni_phase <= 1'b0;
 				timeout       <= 16'd0;
 				state         <= S_QRY_WAIT_W;
-			end else begin
+			end else if (rd_data[31:0] - WRAM_LIMIT < {14'd0, bsram_size}) begin
 				bsram_addr <= rd_data[31:0] - 32'h20000;
 				state      <= S_QRY_LATCH_B;  // extra cycle for altsyncram latency
+			end else begin
+				// Unmapped: qry_value stays 0 for the whole query
+				state <= S_QRY_WR_RESP;
 			end
 		end
 
@@ -683,20 +717,23 @@ always @(posedge clk) begin
 			qry_byte_idx <= qry_byte_idx + 3'd1;
 			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
 				state <= S_QRY_WR_RESP;
-			end else begin
+			end else if (qry_addr + 32'd1 - WRAM_LIMIT < {14'd0, bsram_size}) begin
 				qry_addr   <= qry_addr + 32'd1;
 				bsram_addr <= qry_addr + 32'd1 - 32'h20000;
 				state      <= S_QRY_LATCH_B;  // wait again for next byte
+			end else begin
+				// Ran off the end mid-read: remaining bytes stay 0
+				state <= S_QRY_WR_RESP;
 			end
 		end
 
 		S_QRY_WR_RESP: begin
-			ddram_wr_addr <= QUERY_RESP_BASE + {25'd0, qry_idx};
+			ddram_wr_addr <= QUERY_RESP_BASE + {25'd0, qry_idx[3:0]};
 			ddram_wr_din  <= {32'd0, qry_value};
 			ddram_wr_be   <= 8'hFF;
 			ddram_wr_req  <= ~ddram_wr_req;
-			qry_idx       <= qry_idx + 4'd1;
-			if (qry_idx + 4'd1 >= qry_num[3:0]) begin
+			qry_idx       <= qry_idx + 5'd1;
+			if (qry_idx + 5'd1 >= {1'b0, qry_num[7:0]}) begin
 				return_state <= S_QRY_WR_CTRL;
 			end else begin
 				return_state <= S_QRY_RD_REQ;

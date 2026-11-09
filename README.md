@@ -13,13 +13,14 @@ The upstream SNES core is a cycle-accurate FPGA SNES replica. This fork adds a n
 | File | Purpose |
 |------|---------|
 | `rtl/ra_ram_mirror_snes.sv` | Reads emulated SNES RAM and writes it to DDRAM so the ARM CPU can access it |
+| `rtl/ra_sni_arb.sv` | Shares the SDRAM SNI port between the RA mirror and a host PC tool (QUsb2Snes and others) |
 
 ### Modified Files
 
 | File | Change |
 |------|--------|
-| `SNES.sv` | Instantiates `ra_ram_mirror_snes`, adds DDRAM read/write channels for RA, multiplexes SNI and BSRAM ports |
-| `files.qip` | Adds `rtl/ra_ram_mirror_snes.sv` to the Quartus project |
+| `SNES.sv` | Instantiates `ra_ram_mirror_snes` and `ra_sni_arb`, adds DDRAM read/write channels for RA, shares the SNI and BSRAM ports |
+| `files.qip` | Adds `rtl/ra_ram_mirror_snes.sv` and `rtl/ra_sni_arb.sv` to the Quartus project |
 
 ### How the RAM Mirror Works
 
@@ -50,7 +51,8 @@ This request/response approach keeps per-frame overhead to ~30 µs instead of co
 
 ### FPGA Integration Details
 
-- **SNI port multiplexing**: when the RA mirror is active (`ra_active`), it takes over the SNI read port to fetch WRAM bytes; otherwise the port operates normally.
+- **SNI port sharing**: the RA mirror reads WRAM through the same SDRAM SNI port that a host PC tool uses over UART. `sdram.sv` serves one SNI client at a time, so `ra_sni_arb` issues their accesses one after the other and gives each its own ready and data. A host tool can run alongside RA without either one reading the other's bytes.
+- **Hardcore**: SNI writes from a host PC to SDRAM and BSRAM are dropped while hardcore is on; reads still work, so trackers and autosplitters keep running.
 - **BSRAM port arbitration**: RA reads are interleaved with normal game access via priority logic.
 - **DDRAM arbiter**: extended with dedicated read/write channels for the RA mirror, separate from savestates (ch0) and MSU-1 audio (ch1).
 - **BSRAM size**: computed from `ram_mask` in the cartridge header and passed to the mirror module.
