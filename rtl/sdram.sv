@@ -40,7 +40,8 @@ module sdram
 	input             sni_wr_req,
 	input             sni_rd_req,
 	input             sni_word,
-	output reg        sni_ready
+	output reg        sni_ready,
+	input             sni_hold    // 1 = do not start an SNI access (see the guard in SNES.sv)
 `ifdef DEBUG
                      ,
 	output [1:0] dbg_ctrl_bank,
@@ -140,7 +141,7 @@ module sdram
 	wire sni_wr_pending = sni_wr_pending_ | (sni_wr_req && !old_sni_wr);
 
 	wire can_start_sni =
-		~rfs & ~rfs1 & (
+		~sni_hold & ~rfs & ~rfs1 & (
 			(~read[0] & ~read[1]) &
 			(~write[0] & ~write[1]));
 
